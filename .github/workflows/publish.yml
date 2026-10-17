@@ -1,0 +1,138 @@
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The release.yml run in the launcher repository
+        required: true
+      tag:
+        description: The launcher tag, vX.Y.Z
+        required: true
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SOURCE: Vetther/graj-launcher
+  RUN_ID: ${{ inputs.run_id }}
+  TAG: ${{ inputs.tag }}
+  PAGES: https://vetther-playground.github.io/releases
+  PLATFORMS: macos-arm64 macos-x64 windows-x64 linux-x64
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: The build is a passed vX.Y.Z tag on main
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "tag $TAG is not vX.Y.Z"
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || fail "run id $RUN_ID is not a number"
+          run=$(gh api "repos/$SOURCE/actions/runs/$RUN_ID")
+          [ "$(jq -r .path <<<"$run")" = .github/workflows/release.yml ] || fail "run $RUN_ID is not release.yml"
+          [ "$(jq -r .event <<<"$run")" = push ] || fail "run $RUN_ID did not start from a tag push"
+          [ "$(jq -r .head_branch <<<"$run")" = "$TAG" ] || fail "run $RUN_ID built another ref than $TAG"
+          sha=$(jq -r .head_sha <<<"$run")
+          [ "$(gh api "repos/$SOURCE/commits/$TAG" --jq .sha)" = "$sha" ] || fail "$TAG no longer points at the built commit"
+          case "$(gh api "repos/$SOURCE/compare/main...$sha" --jq .status)" in
+            identical | behind) ;;
+            *) fail "$sha is not on main" ;;
+          esac
+          builds=$(gh api "repos/$SOURCE/actions/runs/$RUN_ID/jobs?per_page=100" --jq '[.jobs[] | select(.name | startswith("build ("))]')
+          [ "$(jq length <<<"$builds")" = 4 ] || fail "run $RUN_ID does not have four build jobs"
+          [ "$(jq '[.[] | select(.conclusion != "success")] | length' <<<"$builds")" = 0 ] || fail "a build job of run $RUN_ID did not pass"
+          echo "SHA=$sha" >>"$GITHUB_ENV"
+
+      - name: Download the build
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: gh run download "$RUN_ID" --repo "$SOURCE" --dir build
+
+      - name: Every platform passed its audit, files as built
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          for platform in $PLATFORMS; do
+            dir="build/release-$platform"
+            grep -qx "Result: PASS, no findings." "$dir/audit-$platform.txt" || fail "$platform: the audit did not pass"
+            (cd "$dir" && sha256sum --check --strict --quiet SHA256SUMS) || fail "$platform: files differ from the build"
+          done
+          tar -xf build/release-tools/release-tools.tar -C build
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          distribution: jetbrains
+          java-version: "25"
+          java-package: jdk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Sign the manifest
+        env:
+          RELEASE_KEY: ${{ secrets.RELEASE_KEY }}
+        run: |
+          descriptor=build/release-linux-x64/version.properties
+          arguments=()
+          for platform in $PLATFORMS; do arguments+=(--platform "$platform=build/release-$platform/update"); done
+          if curl -fsS "$PAGES/launcher/manifest.json?run=$GITHUB_RUN_ID" -o build/previous.json; then arguments+=(--previous build/previous.json); fi
+          build/release-tools/bin/release-tools manifest --version "${TAG#v}" \
+            --main-class "$(sed -n 's/^mainClass=//p' "$descriptor")" \
+            --min-bootstrap "$(sed -n 's/^minBootstrapVersion=//p' "$descriptor")" \
+            --asset-url "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-$TAG" \
+            --sign env:RELEASE_KEY --out build/out "${arguments[@]}"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release="launcher-$TAG"
+          assets=()
+          for platform in $PLATFORMS; do
+            for file in build/release-$platform/*.dmg build/release-$platform/*.msi build/release-$platform/*.deb \
+              build/release-$platform/*.rpm build/release-$platform/audit-$platform.txt; do
+              if [ -f "$file" ]; then assets+=("$file"); fi
+            done
+          done
+          while read -r hash; do assets+=("build/out/sha256/$hash"); done <build/out/upload.txt
+          gh release create "$release" --repo "$GITHUB_REPOSITORY" --draft --title "Launcher ${TAG#v}" --notes "Commit $SHA."
+          gh release upload "$release" --repo "$GITHUB_REPOSITORY" "${assets[@]}"
+          gh release edit "$release" --repo "$GITHUB_REPOSITORY" --draft=false
+
+      - name: Point the manifest at the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p launcher
+          cp build/out/manifest.json launcher/manifest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add launcher/manifest.json
+          git commit -m "Publish launcher ${TAG#v}"
+          git push origin HEAD:main
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pages/builds" >/dev/null
+
+      - name: The release is live
+        run: |
+          for attempt in $(seq 60); do
+            if curl -fsS "$PAGES/launcher/manifest.json?check=$attempt" | cmp -s - build/out/manifest.json; then live=1; break; fi
+            sleep 10
+          done
+          [ -n "${live:-}" ] || { echo "::error::Pages does not serve the new manifest after 10 minutes"; exit 1; }
+          while read -r hash; do
+            curl -fsSL -o /dev/null "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-$TAG/$hash"
+          done <build/out/upload.txt
