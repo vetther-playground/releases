@@ -1,4 +1,5 @@
 name: publish
+run-name: Publish ${{ inputs.tag }} from run ${{ inputs.run_id }}
 
 on:
   workflow_dispatch:
