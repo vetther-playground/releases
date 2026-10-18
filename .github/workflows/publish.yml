@@ -97,8 +97,6 @@ jobs:
             --asset-url "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-files-$TAG" \
             --sign env:RELEASE_KEY --out build/out "${arguments[@]}"
 
-      # The update files the manifest names go to their own release, so the version's page lists only installers and
-      # audit reports. Files that have not changed stay in the release that first published them.
       - name: Publish the update files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,7 +119,7 @@ jobs:
           assets=()
           for platform in $PLATFORMS; do
             for file in build/release-$platform/*.dmg build/release-$platform/*.msi build/release-$platform/*.deb \
-              build/release-$platform/*.rpm build/release-$platform/audit-$platform.txt; do
+              build/release-$platform/*.rpm; do
               if [ -f "$file" ]; then assets+=("$file"); fi
             done
           done
