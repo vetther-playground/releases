@@ -94,8 +94,24 @@ jobs:
           build/release-tools/bin/release-tools manifest --version "${TAG#v}" \
             --main-class "$(sed -n 's/^mainClass=//p' "$descriptor")" \
             --min-bootstrap "$(sed -n 's/^minBootstrapVersion=//p' "$descriptor")" \
-            --asset-url "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-$TAG" \
+            --asset-url "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-files-$TAG" \
             --sign env:RELEASE_KEY --out build/out "${arguments[@]}"
+
+      # The update files the manifest names go to their own release, so the version's page lists only installers and
+      # audit reports. Files that have not changed stay in the release that first published them.
+      - name: Publish the update files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release="launcher-files-$TAG"
+          files=()
+          while read -r hash; do files+=("build/out/sha256/$hash"); done <build/out/upload.txt
+          if [ "${#files[@]}" -gt 0 ]; then
+            gh release create "$release" --repo "$GITHUB_REPOSITORY" --draft --latest=false \
+              --title "Launcher ${TAG#v} update files" --notes "Commit $SHA."
+            gh release upload "$release" --repo "$GITHUB_REPOSITORY" "${files[@]}"
+            gh release edit "$release" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+          fi
 
       - name: Publish the release
         env:
@@ -109,10 +125,9 @@ jobs:
               if [ -f "$file" ]; then assets+=("$file"); fi
             done
           done
-          while read -r hash; do assets+=("build/out/sha256/$hash"); done <build/out/upload.txt
           gh release create "$release" --repo "$GITHUB_REPOSITORY" --draft --title "Launcher ${TAG#v}" --notes "Commit $SHA."
           gh release upload "$release" --repo "$GITHUB_REPOSITORY" "${assets[@]}"
-          gh release edit "$release" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release edit "$release" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
       - name: Point the manifest at the release
         env:
@@ -135,5 +150,5 @@ jobs:
           done
           [ -n "${live:-}" ] || { echo "::error::Pages does not serve the new manifest after 10 minutes"; exit 1; }
           while read -r hash; do
-            curl -fsSL -o /dev/null "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-$TAG/$hash"
+            curl -fsSL -o /dev/null "https://github.com/$GITHUB_REPOSITORY/releases/download/launcher-files-$TAG/$hash"
           done <build/out/upload.txt
